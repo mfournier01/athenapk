@@ -24,10 +24,6 @@
 #include <string>
 #include <vector>
 
-#include <cstdint>
-#include <cstdlib>
-#include <ctime>
-
 // Parthenon headers
 #include "basic_types.hpp"
 #include "interface/metadata.hpp"
@@ -54,27 +50,14 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
 
   // Add swarm of tracers
   std::string swarm_name = "tracers";
-
-  // Creating variables for block offsets
-  const std::uint64_t nblocks = 64; // Still hardcoded for now
-  const std::uint64_t max_uint64 = UINT64_MAX;
-  const std::uint64_t offset_per_block = max_uint64 / nblocks;
-
-  for (std::uint64_t block_id = 0; block_id < nblocks; ++block_id) {
-    std::uint64_t offset = block_id * offset_per_block;
-
-    tracer_pkg->AddParam<std::uint64_t>(swarm_name + "_block_" +
-                                            std::to_string(block_id) + "_offset",
-                                        offset, Params::Mutability::Restart);
-  }
-
   tracer_pkg->AddParam<>("swarm_name", swarm_name);
-
   // TODO(pgrete) Check where metadata, e.g., for restart is required (i.e., at the swarm
   // or variable level).
   Metadata swarm_metadata({Metadata::Provides, Metadata::None, Metadata::Restart});
   tracer_pkg->AddSwarm(swarm_name, swarm_metadata);
   Metadata real_swarmvalue_metadata({Metadata::Real});
+  tracer_pkg->AddSwarmValue("id", swarm_name,
+                            Metadata({Metadata::Integer, Metadata::Restart}));
 
   // TODO(pgrete) Add CheckDesired/required for vars
   // thermo variables
@@ -114,7 +97,6 @@ void SeedInitialTracers(Mesh *pmesh, ParameterInput *pin, parthenon::SimTime &tm
   // driver is executed (also also for restarts)
   if (pmesh->is_restart) return;
 
-  const std::string swarm_name = "tracers";
   auto tracers_pkg = pmesh->packages.Get("tracers");
 
   const auto seed_method = pin->GetOrAddString("tracers", "initial_seed_method", "none");
@@ -136,8 +118,7 @@ void SeedInitialTracers(Mesh *pmesh, ParameterInput *pin, parthenon::SimTime &tm
     int rng_seed = pin->GetOrAddInteger("tracers", "initial_rng_seed", 0);
 
     for (auto &pmb : pmesh->block_list) {
-      auto &swarm = pmb->meshblock_data.Get()->GetSwarmData()->Get(swarm_name);
-
+      auto &swarm = pmb->meshblock_data.Get()->GetSwarmData()->Get("tracers");
       // Seed is meshblock gid for consistency across MPI decomposition
       RNGPool rng_pool(pmb->gid + rng_seed);
 
@@ -158,10 +139,7 @@ void SeedInitialTracers(Mesh *pmesh, ParameterInput *pin, parthenon::SimTime &tm
       auto &x = swarm->Get<Real>(swarm_position::x::name()).Get();
       auto &y = swarm->Get<Real>(swarm_position::y::name()).Get();
       auto &z = swarm->Get<Real>(swarm_position::z::name()).Get();
-      auto &id = swarm->Get<std::uint64_t>(swarm_position::id::name()).Get();
-
-      auto block_offset = tracers_pkg->Param<std::uint64_t>(
-          "tracers_block_" + std::to_string(pmb->gid) + "_offset");
+      auto &id = swarm->Get<int>("id").Get();
 
       auto swarm_d = swarm->GetDeviceContext();
 
@@ -179,7 +157,7 @@ void SeedInitialTracers(Mesh *pmesh, ParameterInput *pin, parthenon::SimTime &tm
             // Note that his works only during one time init.
             // If (somehwere else) we eventually add dynamic particles, then we need to
             // manage ids (not indices) more globally.
-            id(n) = block_offset + n;
+            id(n) = num_tracers_per_block * gid + n;
 
             rng_pool.free_state(rng_gen);
 
@@ -187,9 +165,6 @@ void SeedInitialTracers(Mesh *pmesh, ParameterInput *pin, parthenon::SimTime &tm
             bool on_current_mesh_block = true;
             swarm_d.GetNeighborBlockIndex(n, x(n), y(n), z(n), on_current_mesh_block);
           });
-
-      tracers_pkg->UpdateParam("tracers_block_" + std::to_string(pmb->gid) + "_offset",
-                               block_offset + num_tracers_per_block);
     }
   } else {
     PARTHENON_THROW("Unknown tracer initial_seed_method");
@@ -219,8 +194,6 @@ TaskStatus AdvectTracers(MeshBlockData<Real> *mbd, const Real dt) {
   auto &x = swarm->Get<Real>(swarm_position::x::name()).Get();
   auto &y = swarm->Get<Real>(swarm_position::y::name()).Get();
   auto &z = swarm->Get<Real>(swarm_position::z::name()).Get();
-  auto &id = swarm->Get<std::uint64_t>(swarm_position::id::name()).Get();
-
   auto &vel_x = swarm->Get<Real>("vel_x").Get();
   auto &vel_y = swarm->Get<Real>("vel_y").Get();
   auto &vel_z = swarm->Get<Real>("vel_z").Get();
@@ -231,7 +204,6 @@ TaskStatus AdvectTracers(MeshBlockData<Real> *mbd, const Real dt) {
 
   // update loop. RK2
   const int max_active_index = swarm->GetMaxActiveIndex();
-
   pmb->par_for(
       "Advect Tracers", 0, max_active_index, KOKKOS_LAMBDA(const int n) {
         if (swarm_d.IsActive(n)) {
